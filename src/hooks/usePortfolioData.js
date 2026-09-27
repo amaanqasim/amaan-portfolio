@@ -1,15 +1,41 @@
-// usePortfolioData.js — React hook for reactive portfolio data
+// usePortfolioData.js — React hook for reactive portfolio data with Firebase Firestore & localStorage sync
 import { useState, useEffect, useCallback } from "react";
 import {
   getPortfolioData,
   savePortfolioData,
   THEME_PRESETS,
 } from "../data/portfolioData";
+import { db, isConfigured } from "../firebase";
+import { doc, onSnapshot, setDoc } from "firebase/firestore";
 
 export function usePortfolioData() {
   const [data, setData] = useState(() => getPortfolioData());
 
   useEffect(() => {
+    // 1. Firebase Firestore real-time listener if configured
+    if (isConfigured && db) {
+      const docRef = doc(db, "portfolio", "main");
+      const unsubscribe = onSnapshot(
+        docRef,
+        (snapshot) => {
+          if (snapshot.exists()) {
+            const remoteData = snapshot.data();
+            setData(remoteData);
+            savePortfolioData(remoteData, false); // sync locally without re-triggering event
+          } else {
+            // First time setup: push local default data to Firestore
+            setDoc(docRef, getPortfolioData()).catch(console.error);
+          }
+        },
+        (error) => {
+          console.warn("Firestore subscription warning:", error);
+        }
+      );
+
+      return () => unsubscribe();
+    }
+
+    // 2. Local storage listener fallback
     const handler = () => {
       setData(getPortfolioData());
     };
@@ -20,7 +46,17 @@ export function usePortfolioData() {
   const updateData = useCallback((updater) => {
     const currentData = getPortfolioData();
     const next = typeof updater === "function" ? updater(currentData) : updater;
+
+    // Save locally
     savePortfolioData(next);
+
+    // Sync to Firebase Firestore if configured
+    if (isConfigured && db) {
+      const docRef = doc(db, "portfolio", "main");
+      setDoc(docRef, next, { merge: true }).catch((err) =>
+        console.error("Failed to sync to Firestore:", err)
+      );
+    }
   }, []);
 
   return { data, updateData };
@@ -68,7 +104,10 @@ export function useTheme() {
   };
 
   const toggleMode = () => {
-    const currentMode = document.documentElement.getAttribute("data-theme") || data.theme?.mode || "dark";
+    const currentMode =
+      document.documentElement.getAttribute("data-theme") ||
+      data.theme?.mode ||
+      "dark";
     const newMode = currentMode === "dark" ? "light" : "dark";
     document.documentElement.setAttribute("data-theme", newMode);
     updateData((prev) => ({
@@ -90,5 +129,12 @@ export function useTheme() {
     }));
   };
 
-  return { preset, presetKey: data.theme?.preset, setThemePreset, toggleMode, setMode, mode: data.theme?.mode || "dark" };
+  return {
+    preset,
+    presetKey: data.theme?.preset,
+    setThemePreset,
+    toggleMode,
+    setMode,
+    mode: data.theme?.mode || "dark",
+  };
 }

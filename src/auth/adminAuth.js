@@ -1,18 +1,23 @@
-// adminAuth.js — Robust client-side security with PBKDF2 hashing, rate limiting, and recovery key support
+// adminAuth.js — Multi-device Auth via Firebase Auth (or fallback to PBKDF2 local hashing)
+import { auth, isConfigured } from "../firebase";
+import {
+  signInWithEmailAndPassword,
+  updatePassword as fbUpdatePassword,
+  signOut as fbSignOut,
+} from "firebase/auth";
 
 const ADMIN_KEY = "amaan_portfolio_admin_session";
 const LOCKOUT_KEY = "amaan_admin_lockout";
 const CREDS_KEY = "amaan_admin_creds";
-
 const DEFAULT_RECOVERY_KEY = "AQ-2026-RECOVER";
 
 const DEFAULT_CREDENTIALS = {
   username: "amaan",
+  email: "amaanqasim000@gmail.com",
   passwordChanged: false,
   recoveryKey: DEFAULT_RECOVERY_KEY,
 };
 
-// Cryptographically strong PBKDF2 hashing with 100,000 iterations
 async function pbkdf2Hash(password, salt = "amaan_salt_portfolio_2026") {
   const encoder = new TextEncoder();
   const passwordBuffer = encoder.encode(password);
@@ -55,12 +60,13 @@ function saveCredentials(creds) {
   localStorage.setItem(CREDS_KEY, JSON.stringify(creds));
 }
 
-// Rate-limiting check
 export function getLockoutState() {
   try {
     const lockoutData = JSON.parse(localStorage.getItem(LOCKOUT_KEY));
     if (lockoutData && lockoutData.lockedUntil > Date.now()) {
-      const remainingSeconds = Math.ceil((lockoutData.lockedUntil - Date.now()) / 1000);
+      const remainingSeconds = Math.ceil(
+        (lockoutData.lockedUntil - Date.now()) / 1000
+      );
       return { isLocked: true, remainingSeconds, attempts: lockoutData.attempts };
     }
   } catch {}
@@ -69,15 +75,15 @@ export function getLockoutState() {
 
 function recordFailedAttempt() {
   try {
-    const lockoutData = JSON.parse(localStorage.getItem(LOCKOUT_KEY)) || { attempts: 0, lockedUntil: 0 };
+    const lockoutData = JSON.parse(localStorage.getItem(LOCKOUT_KEY)) || {
+      attempts: 0,
+      lockedUntil: 0,
+    };
     const attempts = lockoutData.attempts + 1;
-
     let lockedUntil = 0;
     if (attempts >= 5) {
-      // Lock out for 15 minutes after 5 failed attempts
       lockedUntil = Date.now() + 15 * 60 * 1000;
     }
-
     localStorage.setItem(LOCKOUT_KEY, JSON.stringify({ attempts, lockedUntil }));
     return { attempts, isLocked: attempts >= 5, remainingSeconds: 15 * 60 };
   } catch (e) {
@@ -89,24 +95,61 @@ function resetFailedAttempts() {
   localStorage.removeItem(LOCKOUT_KEY);
 }
 
-export async function loginAdmin(username, password) {
+export async function loginAdmin(usernameOrEmail, password) {
   const lockout = getLockoutState();
   if (lockout.isLocked) {
     return {
       success: false,
       isLocked: true,
       remainingSeconds: lockout.remainingSeconds,
-      error: `Too many failed attempts. Try again in ${Math.ceil(lockout.remainingSeconds / 60)} mins.`,
+      error: `Too many failed attempts. Try again in ${Math.ceil(
+        lockout.remainingSeconds / 60
+      )} mins.`,
     };
   }
 
+  // 1. Firebase Auth Mode (Syncs across devices)
+  if (isConfigured && auth) {
+    try {
+      // If user passed username, map to default email if needed
+      const emailToUse = usernameOrEmail.includes("@")
+        ? usernameOrEmail
+        : "amaanqasim000@gmail.com";
+
+      const userCred = await signInWithEmailAndPassword(auth, emailToUse, password);
+      resetFailedAttempts();
+      const session = {
+        token: userCred.user.uid,
+        expires: Date.now() + 2 * 60 * 60 * 1000,
+        username: emailToUse,
+        isFirebase: true,
+      };
+      sessionStorage.setItem(ADMIN_KEY, JSON.stringify(session));
+      return { success: true, isDefaultPassword: false };
+    } catch (fbError) {
+      console.warn("Firebase Auth attempt failed:", fbError.message);
+      const failedState = recordFailedAttempt();
+      return {
+        success: false,
+        error:
+          fbError.code === "auth/invalid-credential" || fbError.code === "auth/wrong-password"
+            ? `Invalid credentials. (${5 - failedState.attempts} attempt(s) remaining)`
+            : fbError.message,
+      };
+    }
+  }
+
+  // 2. Local Fallback Mode
   const creds = getCredentials();
   const hash = await pbkdf2Hash(password);
 
   let isValid = false;
   let isDefaultPassword = false;
 
-  if (username !== creds.username) {
+  if (
+    usernameOrEmail !== creds.username &&
+    usernameOrEmail !== creds.email
+  ) {
     recordFailedAttempt();
     return { success: false, error: "Invalid username or password." };
   }
@@ -124,8 +167,8 @@ export async function loginAdmin(username, password) {
     const sessionToken = generateSessionToken();
     const session = {
       token: sessionToken,
-      expires: Date.now() + 2 * 60 * 60 * 1000, // 2 hours expiry
-      username,
+      expires: Date.now() + 2 * 60 * 60 * 1000,
+      username: usernameOrEmail,
     };
     sessionStorage.setItem(ADMIN_KEY, JSON.stringify(session));
     return { success: true, isDefaultPassword };
@@ -140,7 +183,6 @@ export async function loginAdmin(username, password) {
   };
 }
 
-// Reset password via Recovery Key
 export async function recoverPassword(recoveryKeyInput, newPassword) {
   const creds = getCredentials();
   const targetRecoveryKey = creds.recoveryKey || DEFAULT_RECOVERY_KEY;
@@ -151,6 +193,15 @@ export async function recoverPassword(recoveryKeyInput, newPassword) {
 
   if (!newPassword || newPassword.length < 8) {
     return { success: false, error: "New password must be at least 8 characters long." };
+  }
+
+  // Firebase update if logged in
+  if (isConfigured && auth && auth.currentUser) {
+    try {
+      await fbUpdatePassword(auth.currentUser, newPassword);
+    } catch (e) {
+      console.warn("Firebase password update error:", e);
+    }
   }
 
   const newHash = await pbkdf2Hash(newPassword);
@@ -176,13 +227,33 @@ export function isAdminAuthenticated() {
 }
 
 export function logoutAdmin() {
+  if (isConfigured && auth) {
+    fbSignOut(auth).catch(() => {});
+  }
   sessionStorage.removeItem(ADMIN_KEY);
 }
 
 export async function changePassword(currentPassword, newPassword, customRecoveryKey) {
   const creds = getCredentials();
-  const currentHash = await pbkdf2Hash(currentPassword);
 
+  // If using Firebase Auth and user is logged in
+  if (isConfigured && auth && auth.currentUser) {
+    try {
+      await fbUpdatePassword(auth.currentUser, newPassword);
+      return { success: true };
+    } catch (err) {
+      if (err.code === "auth/requires-recent-login") {
+        return {
+          success: false,
+          error: "Please log out and log back in to update your password.",
+        };
+      }
+      return { success: false, error: err.message };
+    }
+  }
+
+  // Local fallback password change
+  const currentHash = await pbkdf2Hash(currentPassword);
   let currentIsValid = false;
   if (creds.passwordChanged && creds.passwordHash) {
     currentIsValid = currentHash === creds.passwordHash;

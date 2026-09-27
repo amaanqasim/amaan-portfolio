@@ -1,6 +1,4 @@
-// portfolioData.js — Central data store with localStorage persistence
-// Admin panel reads/writes to this via the usePortfolioData hook
-
+// portfolioData.js — Central data store with localStorage & Firebase sync
 const DEFAULT_DATA = {
   personal: {
     name: "Amaan Qasim",
@@ -86,13 +84,12 @@ const DEFAULT_DATA = {
   ],
 
   theme: {
-    preset: "amber", // amber | cyan | violet | emerald | rose
+    preset: "amber",
     mode: "dark",
     showPercentage: true,
   },
 };
 
-// Theme presets with HSL values
 export const THEME_PRESETS = {
   amber: {
     name: "Warm Amber",
@@ -143,7 +140,6 @@ export function getPortfolioData() {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       const parsed = JSON.parse(stored);
-      // Merge with defaults to catch any new fields
       return deepMerge(DEFAULT_DATA, parsed);
     }
   } catch (e) {
@@ -152,11 +148,12 @@ export function getPortfolioData() {
   return { ...DEFAULT_DATA };
 }
 
-export function savePortfolioData(data) {
+export function savePortfolioData(data, emitEvent = true) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    // Dispatch custom event so all components re-render
-    window.dispatchEvent(new CustomEvent("portfolio-data-updated"));
+    if (emitEvent) {
+      window.dispatchEvent(new CustomEvent("portfolio-data-updated"));
+    }
   } catch (e) {
     console.error("Failed to save portfolio data", e);
   }
